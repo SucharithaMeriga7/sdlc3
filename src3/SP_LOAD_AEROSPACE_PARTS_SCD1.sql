@@ -31,135 +31,170 @@ BEGIN
     v_batch_id := UUID_STRING();
     v_start_ts := CURRENT_TIMESTAMP()::TIMESTAMP_NTZ;
 
+    -- Watermark: last successful run or full load on first run
     SELECT COALESCE(MAX(RUN_TIMESTAMP), '1900-01-01'::TIMESTAMP_NTZ)
       INTO v_last_load_ts
       FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.ETL_RECONCILIATION_LOG
-     WHERE PROCEDURE_NAME = 'SP_LOAD_AEROSPACE_PARTS_SCD1'
-       AND RUN_STATUS = 'SUCCESS';
+     WHERE RUN_STATUS = 'SUCCESS';
 
-    -- Stage deduplicated incremental source with transformations
-    CREATE OR REPLACE TEMPORARY TABLE TEMP_AEROSPACE_STAGE AS
-    WITH DEDUP AS (
+    -- Snapshot target count before merge
+    SELECT COUNT(1) INTO v_tgt_count_before
+      FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.AEROSPACE_PARTS_TARGET;
+
+    -- Stage: incremental, deduplicated, exclusion-filtered, transformed
+    CREATE OR REPLACE TEMPORARY TABLE STAGE_AEROSPACE_PARTS AS
+    WITH DEDUPED AS (
         SELECT *,
                ROW_NUMBER() OVER (PARTITION BY PART_NUMBER ORDER BY UPDATED_AT DESC) AS RN
           FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.AEROSPACE_PARTS_SOURCE
-         WHERE UPDATED_AT > v_last_load_ts
+         WHERE UPDATED_AT > :v_last_load_ts
     )
     SELECT
         PART_NUMBER,
         INITCAP(MANUFACTURER)                                          AS MANUFACTURER,
+        PART_NAME,
+        PART_CATEGORY,
         NULLIF(CASE WHEN WEIGHT_KG <= 0 THEN NULL ELSE WEIGHT_KG END, 0) AS WEIGHT_KG,
         ROUND(UNIT_PRICE_USD, 2)                                       AS UNIT_PRICE_USD,
+        LEAD_TIME_DAYS,
+        CERTIFICATION_STATUS,
         LIFECYCLE_STATUS,
         INSTALLATION_DATE,
-        CERTIFICATION_STATUS,
-        LEAD_TIME_DAYS,
+        SUPPLIER_ID,
+        WAREHOUSE_LOCATION,
         UPDATED_AT,
         CASE
-            WHEN CERTIFICATION_STATUS = 'Pending' AND LEAD_TIME_DAYS > 90  THEN 'High Risk'
-            WHEN CERTIFICATION_STATUS = 'Pending' OR  LEAD_TIME_DAYS > 120 THEN 'Medium Risk'
-            WHEN CERTIFICATION_STATUS IN ('FAA','EASA','Dual') AND LEAD_TIME_DAYS <= 60 THEN 'Low Risk'
+            WHEN CERTIFICATION_STATUS = 'Certification Pending' AND LEAD_TIME_DAYS > 90  THEN 'High Risk'
+            WHEN CERTIFICATION_STATUS = 'Certification Pending' OR  LEAD_TIME_DAYS > 120 THEN 'Medium Risk'
+            WHEN CERTIFICATION_STATUS IN ('FAA','EASA','Dual')  AND LEAD_TIME_DAYS <= 60 THEN 'Low Risk'
             ELSE 'Medium Risk'
         END                                                            AS RISK_SCORE
-      FROM DEDUP
+      FROM DEDUPED
      WHERE RN = 1
-       AND NOT (LIFECYCLE_STATUS = 'End of Life'
-                AND INSTALLATION_DATE < DATEADD(YEAR, -3, CURRENT_DATE()));
+       AND NOT (
+               LIFECYCLE_STATUS = 'End of Life'
+           AND INSTALLATION_DATE < DATEADD(YEAR, -3, CURRENT_DATE())
+           );
 
     -- SECTION 3: Data Validation
-    SELECT COUNT(*) INTO v_src_count        FROM TEMP_AEROSPACE_STAGE;
-    SELECT COUNT(*) INTO v_tgt_count_before FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.AEROSPACE_PARTS_TARGET;
-    SELECT COUNT(*) INTO v_reject_count
+    SELECT COUNT(1) INTO v_src_count  FROM STAGE_AEROSPACE_PARTS;
+    SELECT COUNT(1) INTO v_reject_count
       FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.AEROSPACE_PARTS_SOURCE
-     WHERE UPDATED_AT > v_last_load_ts
-       AND LIFECYCLE_STATUS = 'End of Life'
-       AND INSTALLATION_DATE < DATEADD(YEAR, -3, CURRENT_DATE());
+     WHERE UPDATED_AT > :v_last_load_ts
+       AND PART_NUMBER IS NULL;
 
     -- SECTION 4: Merge Logic
-    MERGE INTO GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.AEROSPACE_PARTS_TARGET  T
-    USING TEMP_AEROSPACE_STAGE                                               S
-       ON T.PART_NUMBER = S.PART_NUMBER
-    WHEN MATCHED THEN UPDATE SET
-        T.MANUFACTURER          = S.MANUFACTURER,
-        T.WEIGHT_KG             = S.WEIGHT_KG,
-        T.UNIT_PRICE_USD        = S.UNIT_PRICE_USD,
-        T.LIFECYCLE_STATUS      = S.LIFECYCLE_STATUS,
-        T.INSTALLATION_DATE     = S.INSTALLATION_DATE,
-        T.CERTIFICATION_STATUS  = S.CERTIFICATION_STATUS,
-        T.LEAD_TIME_DAYS        = S.LEAD_TIME_DAYS,
-        T.UPDATED_AT            = S.UPDATED_AT,
-        T.RISK_SCORE            = S.RISK_SCORE,
-        T.ETL_LOAD_TIMESTAMP    = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+    MERGE INTO GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.AEROSPACE_PARTS_TARGET  TGT
+    USING STAGE_AEROSPACE_PARTS                                             SRC
+       ON TGT.PART_NUMBER = SRC.PART_NUMBER
+    WHEN MATCHED AND (
+            TGT.MANUFACTURER       <> SRC.MANUFACTURER       OR
+            TGT.PART_NAME          <> SRC.PART_NAME          OR
+            TGT.PART_CATEGORY      <> SRC.PART_CATEGORY      OR
+            NVL(TGT.WEIGHT_KG,-1)  <> NVL(SRC.WEIGHT_KG,-1) OR
+            TGT.UNIT_PRICE_USD     <> SRC.UNIT_PRICE_USD     OR
+            TGT.LEAD_TIME_DAYS     <> SRC.LEAD_TIME_DAYS     OR
+            TGT.CERTIFICATION_STATUS <> SRC.CERTIFICATION_STATUS OR
+            TGT.LIFECYCLE_STATUS   <> SRC.LIFECYCLE_STATUS   OR
+            TGT.SUPPLIER_ID        <> SRC.SUPPLIER_ID        OR
+            TGT.WAREHOUSE_LOCATION <> SRC.WAREHOUSE_LOCATION OR
+            TGT.RISK_SCORE         <> SRC.RISK_SCORE
+        ) THEN UPDATE SET
+            TGT.MANUFACTURER        = SRC.MANUFACTURER,
+            TGT.PART_NAME           = SRC.PART_NAME,
+            TGT.PART_CATEGORY       = SRC.PART_CATEGORY,
+            TGT.WEIGHT_KG           = SRC.WEIGHT_KG,
+            TGT.UNIT_PRICE_USD      = SRC.UNIT_PRICE_USD,
+            TGT.LEAD_TIME_DAYS      = SRC.LEAD_TIME_DAYS,
+            TGT.CERTIFICATION_STATUS= SRC.CERTIFICATION_STATUS,
+            TGT.LIFECYCLE_STATUS    = SRC.LIFECYCLE_STATUS,
+            TGT.INSTALLATION_DATE   = SRC.INSTALLATION_DATE,
+            TGT.SUPPLIER_ID         = SRC.SUPPLIER_ID,
+            TGT.WAREHOUSE_LOCATION  = SRC.WAREHOUSE_LOCATION,
+            TGT.RISK_SCORE          = SRC.RISK_SCORE,
+            TGT.UPDATED_AT          = SRC.UPDATED_AT,
+            TGT.LAST_MODIFIED_TS    = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
     WHEN NOT MATCHED THEN INSERT (
-        PART_NUMBER, MANUFACTURER, WEIGHT_KG, UNIT_PRICE_USD,
-        LIFECYCLE_STATUS, INSTALLATION_DATE, CERTIFICATION_STATUS,
-        LEAD_TIME_DAYS, UPDATED_AT, RISK_SCORE, ETL_LOAD_TIMESTAMP, DECOMMISSION_TIMESTAMP
-    ) VALUES (
-        S.PART_NUMBER, S.MANUFACTURER, S.WEIGHT_KG, S.UNIT_PRICE_USD,
-        S.LIFECYCLE_STATUS, S.INSTALLATION_DATE, S.CERTIFICATION_STATUS,
-        S.LEAD_TIME_DAYS, S.UPDATED_AT, S.RISK_SCORE,
-        CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, NULL
-    );
+            PART_NUMBER, MANUFACTURER, PART_NAME, PART_CATEGORY,
+            WEIGHT_KG, UNIT_PRICE_USD, LEAD_TIME_DAYS, CERTIFICATION_STATUS,
+            LIFECYCLE_STATUS, INSTALLATION_DATE, SUPPLIER_ID, WAREHOUSE_LOCATION,
+            RISK_SCORE, UPDATED_AT, RECORD_STATUS, CREATED_TS, LAST_MODIFIED_TS
+        ) VALUES (
+            SRC.PART_NUMBER, SRC.MANUFACTURER, SRC.PART_NAME, SRC.PART_CATEGORY,
+            SRC.WEIGHT_KG, SRC.UNIT_PRICE_USD, SRC.LEAD_TIME_DAYS, SRC.CERTIFICATION_STATUS,
+            SRC.LIFECYCLE_STATUS, SRC.INSTALLATION_DATE, SRC.SUPPLIER_ID, SRC.WAREHOUSE_LOCATION,
+            SRC.RISK_SCORE, SRC.UPDATED_AT, 'Active',
+            CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+        );
 
-    SELECT COUNT(*) INTO v_insert_count
-      FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.AEROSPACE_PARTS_TARGET
-     WHERE ETL_LOAD_TIMESTAMP >= v_start_ts AND DECOMMISSION_TIMESTAMP IS NULL;
+    v_insert_count := SQLROWCOUNT;
 
-    -- Soft-delete parts absent from source (not in staging and not already decommissioned)
-    UPDATE GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.AEROSPACE_PARTS_TARGET T
-       SET T.LIFECYCLE_STATUS       = 'Decommissioned',
-           T.DECOMMISSION_TIMESTAMP = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ,
-           T.ETL_LOAD_TIMESTAMP     = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
-     WHERE T.LIFECYCLE_STATUS <> 'Decommissioned'
+    -- Soft delete: mark target records absent from full source as Decommissioned
+    UPDATE GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.AEROSPACE_PARTS_TARGET TGT
+       SET TGT.RECORD_STATUS   = 'Decommissioned',
+           TGT.LAST_MODIFIED_TS = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+     WHERE TGT.RECORD_STATUS  <> 'Decommissioned'
        AND NOT EXISTS (
-           SELECT 1 FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.AEROSPACE_PARTS_SOURCE S
-            WHERE S.PART_NUMBER = T.PART_NUMBER
-       );
+           SELECT 1 FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.AEROSPACE_PARTS_SOURCE SRC
+            WHERE SRC.PART_NUMBER = TGT.PART_NUMBER
+           );
 
-    SELECT COUNT(*) INTO v_delete_count
-      FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.AEROSPACE_PARTS_TARGET
-     WHERE DECOMMISSION_TIMESTAMP >= v_start_ts;
+    v_delete_count := SQLROWCOUNT;
 
-    v_update_count := v_insert_count - v_delete_count;
-    SELECT COUNT(*) INTO v_tgt_count_after FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.AEROSPACE_PARTS_TARGET;
-    v_end_ts := CURRENT_TIMESTAMP()::TIMESTAMP_NTZ;
+    -- Capture final counts
+    SELECT COUNT(1) INTO v_tgt_count_after
+      FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.AEROSPACE_PARTS_TARGET;
+
+    v_update_count := v_tgt_count_after - v_tgt_count_before - v_insert_count + v_delete_count;
+    v_end_ts       := CURRENT_TIMESTAMP()::TIMESTAMP_NTZ;
 
     -- SECTION 5: Reconciliation
     INSERT INTO GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.ETL_RECONCILIATION_LOG (
-        RUN_ID, RUN_TIMESTAMP, PROCEDURE_NAME, SOURCE_COUNT,
-        TARGET_COUNT_BEFORE, TARGET_COUNT_AFTER,
-        INSERT_COUNT, UPDATE_COUNT, SOFT_DELETE_COUNT,
-        REJECT_COUNT, RUN_STATUS, LAST_UPDATED_AT
+        BATCH_ID, PROCEDURE_NAME, RUN_TIMESTAMP, RUN_STATUS,
+        SOURCE_COUNT, INSERT_COUNT, UPDATE_COUNT, DELETE_COUNT,
+        REJECT_COUNT, TGT_COUNT_BEFORE, TGT_COUNT_AFTER,
+        START_TS, END_TS, COMMENTS
     ) VALUES (
-        v_batch_id, v_start_ts, 'SP_LOAD_AEROSPACE_PARTS_SCD1', v_src_count,
-        v_tgt_count_before, v_tgt_count_after,
-        v_insert_count, v_update_count, v_delete_count,
-        v_reject_count, 'SUCCESS', v_end_ts
+        :v_batch_id, 'SP_LOAD_AEROSPACE_PARTS_SCD1', :v_end_ts, 'SUCCESS',
+        :v_src_count, :v_insert_count, :v_update_count, :v_delete_count,
+        :v_reject_count, :v_tgt_count_before, :v_tgt_count_after,
+        :v_start_ts, :v_end_ts, 'SCD1 merge completed successfully'
     );
 
     -- SECTION 6: Error Handling
     v_result := OBJECT_CONSTRUCT(
-        'status',        'SUCCESS',
-        'batch_id',      v_batch_id,
-        'src_count',     v_src_count,
-        'insert_count',  v_insert_count,
-        'update_count',  v_update_count,
-        'delete_count',  v_delete_count,
-        'reject_count',  v_reject_count
+        'status',          'SUCCESS',
+        'batch_id',        :v_batch_id,
+        'source_count',    :v_src_count,
+        'insert_count',    :v_insert_count,
+        'update_count',    :v_update_count,
+        'delete_count',    :v_delete_count,
+        'reject_count',    :v_reject_count,
+        'tgt_before',      :v_tgt_count_before,
+        'tgt_after',       :v_tgt_count_after,
+        'duration_sec',    DATEDIFF('second', :v_start_ts, :v_end_ts)
     )::VARCHAR;
-    RETURN v_result;
+
+    RETURN :v_result;
 
 EXCEPTION WHEN OTHER THEN
     INSERT INTO GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.ETL_RECONCILIATION_LOG (
-        RUN_ID, RUN_TIMESTAMP, PROCEDURE_NAME, SOURCE_COUNT,
-        TARGET_COUNT_BEFORE, TARGET_COUNT_AFTER,
-        INSERT_COUNT, UPDATE_COUNT, SOFT_DELETE_COUNT,
-        REJECT_COUNT, RUN_STATUS, LAST_UPDATED_AT
+        BATCH_ID, PROCEDURE_NAME, RUN_TIMESTAMP, RUN_STATUS,
+        START_TS, END_TS, COMMENTS
     ) VALUES (
-        v_batch_id, v_start_ts, 'SP_LOAD_AEROSPACE_PARTS_SCD1', v_src_count,
-        v_tgt_count_before, 0, 0, 0, 0, 0, 'FAILED',
-        CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+        :v_batch_id, 'SP_LOAD_AEROSPACE_PARTS_SCD1',
+        CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, 'FAILED',
+        :v_start_ts, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, :SQLERRM
     );
-    RETURN OBJECT_CONSTRUCT('error', SQLERRM)::VARCHAR;
+    RETURN OBJECT_CONSTRUCT('error', :SQLERRM, 'batch_id', :v_batch_id)::VARCHAR;
 END;
 $$;
+
+-- Task: daily CRON at 02:00 UTC
+CREATE OR REPLACE TASK GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.TASK_LOAD_AEROSPACE_PARTS_SCD1
+    WAREHOUSE = SNOWFLAKE_LEARNING_WH
+    SCHEDULE  = 'USING CRON 0 2 * * * UTC'
+AS
+    CALL GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.SP_LOAD_AEROSPACE_PARTS_SCD1();
+
+ALTER TASK GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.TASK_LOAD_AEROSPACE_PARTS_SCD1 RESUME;
